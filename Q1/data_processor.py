@@ -18,7 +18,6 @@ import contextlib
 from prometheus_client import Counter, Histogram, start_http_server
 import socket
 
-# Metrics for monitoring
 FETCH_COUNT = Counter('api_fetch_total', 'Total number of API fetch operations', ['api', 'status'])
 TRANSFORM_TIME = Histogram('transform_processing_seconds', 'Time spent transforming data', ['api'])
 STORAGE_TIME = Histogram('storage_processing_seconds', 'Time spent storing data', ['api', 'status'])
@@ -28,7 +27,6 @@ def setup_logger(name, log_file, level=logging.INFO):
     """Configure a logger with file and console handlers."""
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
-    # Ensure the log directory exists
     os.makedirs(os.path.dirname(log_file) if os.path.dirname(log_file) else '.', exist_ok=True)
     
     handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
@@ -40,7 +38,6 @@ def setup_logger(name, log_file, level=logging.INFO):
     logger = logging.getLogger(name)
     logger.setLevel(level)
     
-    # Remove existing handlers to avoid duplicates on reloads
     if logger.hasHandlers():
         logger.handlers.clear()
         
@@ -51,11 +48,9 @@ def setup_logger(name, log_file, level=logging.INFO):
 
 logger = setup_logger('data_processor', 'logs/data_processor.log')
 
-# Load environment variables safely
 load_dotenv()
 
 def get_env_var(var_name, default=None, required=False):
-    """Get environment variable with validation."""
     value = os.getenv(var_name, default)
     if required and not value:
         raise EnvironmentError(f"Required environment variable '{var_name}' is missing")
@@ -70,15 +65,12 @@ API_RATE_LIMIT = int(get_env_var("API_RATE_LIMIT", "10"))  # Requests per second
 WORKER_THREADS = int(get_env_var("WORKER_THREADS", "4"))
 METRICS_PORT = int(get_env_var("METRICS_PORT", "8000"))
 
-# Database connection string
 DATABASE_URL = f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
 
-# Rate limiter semaphore
 api_rate_limiter = None
 
 @contextlib.contextmanager
 def get_db_engine():
-    """Context manager for database engine to ensure proper cleanup."""
     engine = create_engine(
         DATABASE_URL,
         poolclass=QueuePool,
@@ -94,7 +86,6 @@ def get_db_engine():
         engine.dispose()
 
 def initialize_database():
-    """Create the database if it doesn't exist."""
     try:
         base_url = f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}@{MYSQL_HOST}:{MYSQL_PORT}/"
         base_engine = create_engine(base_url)
@@ -110,7 +101,6 @@ def initialize_database():
             base_engine.dispose()
 
 class ApiConfig:
-    """Configuration for API endpoints."""
     def __init__(self, url: str, api_type: str, query: Optional[str] = None, 
                  label: Optional[str] = None, params: Optional[Dict] = None,
                  headers: Optional[Dict] = None, table_name: Optional[str] = None,
@@ -125,7 +115,6 @@ class ApiConfig:
         self.retry_attempts = retry_attempts
         self.timeout = timeout
         
-        # Validate inputs
         if not url:
             raise ValueError("URL is required for ApiConfig")
         if api_type not in ["REST", "GraphQL"]:
@@ -137,7 +126,6 @@ class ApiConfig:
         return f"ApiConfig({self.label}, {self.type})"
 
 async def init_rate_limiter(limit_per_second):
-    """Initialize a rate limiter based on configured limits."""
     global api_rate_limiter
     api_rate_limiter = asyncio.Semaphore(limit_per_second)
 
@@ -148,13 +136,11 @@ async def init_rate_limiter(limit_per_second):
     jitter=backoff.full_jitter
 )
 async def fetch_data(session: aiohttp.ClientSession, api: ApiConfig) -> Tuple[ApiConfig, Any]:
-    """Fetch data from API with rate limiting and retries."""
     global api_rate_limiter
     start_time = time.time()
     logger.info(f"Fetching data from {api.url}")
     
     try:
-        # Use rate limiter if available
         if api_rate_limiter:
             async with api_rate_limiter:
                 return await _do_fetch(session, api)
@@ -166,7 +152,6 @@ async def fetch_data(session: aiohttp.ClientSession, api: ApiConfig) -> Tuple[Ap
         return api, None
 
 async def _do_fetch(session, api):
-    """Internal function to perform the actual API fetch."""
     start_time = time.time()
     
     if api.type == "REST":
@@ -206,14 +191,12 @@ async def _do_fetch(session, api):
             return api, data
 
 def transform_data(raw_data: Any, api_config: ApiConfig) -> List[Dict]:
-    """Transform raw API data into a consistent format."""
     with TRANSFORM_TIME.labels(api=api_config.label).time():
         if not raw_data:
             logger.warning(f"No data to transform for {api_config.url}")
             return []
         
         try:
-            # Special handling for GraphQL responses
             if api_config.type == "GraphQL":
                 if 'data' in raw_data:
                     if 'characters' in raw_data.get('data', {}):
@@ -225,25 +208,20 @@ def transform_data(raw_data: Any, api_config: ApiConfig) -> List[Dict]:
                         if first_key:
                             raw_data = raw_data['data'][first_key]
             
-            # Ensure we have a list of data
             if not isinstance(raw_data, (list, dict)):
                 logger.error(f"Unexpected data format for {api_config.url}: {type(raw_data)}")
                 return []
             
-            # Extract nested results if needed
             if isinstance(raw_data, dict):
                 for key in ['results', 'items', 'data']:
                     if key in raw_data and isinstance(raw_data[key], list):
                         raw_data = raw_data[key]
                         break
                 else:
-                    # If no recognized list field, treat the dict as a single item
                     raw_data = [raw_data]
             
-            # Use pandas for normalization
             df = pd.json_normalize(raw_data)
             
-            # Replace NaN with None for DB compatibility
             df = df.where(pd.notnull(df), None)
             
             return df.to_dict(orient='records')
@@ -253,7 +231,6 @@ def transform_data(raw_data: Any, api_config: ApiConfig) -> List[Dict]:
             return []
 
 def store_data(data: List[Dict], api_config: ApiConfig, engine) -> bool:
-    """Store transformed data to database with chunking for large datasets."""
     with STORAGE_TIME.labels(api=api_config.label, status='processing').time():
         if not data:
             logger.info(f"Skipping storage for empty table: {api_config.table_name}")
@@ -262,17 +239,14 @@ def store_data(data: List[Dict], api_config: ApiConfig, engine) -> bool:
         try:
             df = pd.DataFrame(data)
             
-            # Convert complex types to JSON strings
             for col in df.columns:
                 if df[col].apply(lambda x: isinstance(x, (list, dict))).any():
                     df[col] = df[col].apply(lambda x: json.dumps(x) if x is not None else None)
             
             inspector = inspect(engine)
             
-            # Use replace for first run, append for subsequent chunks
             if_exists = 'replace' if api_config.table_name in inspector.get_table_names() else 'append'
             
-            # Process in chunks to handle large datasets
             chunk_size = 1000
             total_rows = len(df)
             
@@ -288,7 +262,6 @@ def store_data(data: List[Dict], api_config: ApiConfig, engine) -> bool:
                 logger.info(f"Stored chunk {i//chunk_size + 1}/{(total_rows-1)//chunk_size + 1} " +
                            f"({len(chunk)} rows) in table '{api_config.table_name}'")
             
-            # Update metrics
             ROWS_PROCESSED.labels(api=api_config.label).inc(total_rows)
             STORAGE_TIME.labels(api=api_config.label, status='success').observe(0)
             return True
@@ -299,7 +272,6 @@ def store_data(data: List[Dict], api_config: ApiConfig, engine) -> bool:
             return False
 
 def process_data_in_thread_pool(api_config: ApiConfig, raw_data: Any) -> int:
-    """Process data in a thread pool for parallel execution."""
     logger.info(f"Processing data for {api_config.table_name}")
     
     try:
@@ -315,28 +287,21 @@ def process_data_in_thread_pool(api_config: ApiConfig, raw_data: Any) -> int:
         return 0
 
 async def process_apis(apis: List[ApiConfig]) -> Dict[str, int]:
-    """Process a list of APIs, fetching and storing their data."""
     logger.info(f"Starting data processing for {len(apis)} APIs")
     
-    # Initialize the database if needed
     initialize_database()
     
-    # Initialize rate limiter
     await init_rate_limiter(API_RATE_LIMIT)
     
-    # Configure HTTP client
     timeout = aiohttp.ClientTimeout(total=60)
     connector = aiohttp.TCPConnector(limit=10, ssl=False)
     
-    # Track results for reporting
     results = {}
     
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        # Fetch all APIs in parallel
         tasks = [fetch_data(session, api) for api in apis]
         api_results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Process the results in a thread pool
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
             futures = []
             
@@ -354,7 +319,6 @@ async def process_apis(apis: List[ApiConfig]) -> Dict[str, int]:
                     )
                     futures.append((api_config, future))
             
-            # Collect results as they complete
             for api_config, future in futures:
                 try:
                     row_count = future.result()
@@ -369,7 +333,6 @@ async def process_apis(apis: List[ApiConfig]) -> Dict[str, int]:
     return results
 
 def start_metrics_server():
-    """Start a Prometheus metrics server."""
     try:
         start_http_server(METRICS_PORT)
         logger.info(f"Metrics server started on port {METRICS_PORT}")
@@ -377,7 +340,6 @@ def start_metrics_server():
         logger.error(f"Failed to start metrics server: {str(e)}")
 
 def health_check() -> Dict[str, Any]:
-    """Check system health status."""
     health_status = {
         "status": "healthy",
         "timestamp": time.time(),
@@ -385,7 +347,6 @@ def health_check() -> Dict[str, Any]:
         "checks": {}
     }
     
-    # Check database connectivity
     try:
         with get_db_engine() as engine:
             with engine.connect() as conn:
@@ -398,7 +359,6 @@ def health_check() -> Dict[str, Any]:
     return health_status
 
 if __name__ == "__main__":
-    # Example usage when run directly
     start_metrics_server()
     
     apis = [
