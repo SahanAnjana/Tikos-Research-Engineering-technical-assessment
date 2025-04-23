@@ -1,0 +1,12 @@
+Technical_test_RE.pdf
+
+venv/
+
+__pycache__
+
+Q1/.env
+Q1/logs/
+
+Q2/artifacts/
+Q2/data/
+Q2/temp_embeddings

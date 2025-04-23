@@ -1,0 +1,8 @@
+aiohttp
+pandas
+sqlalchemy
+openpyxl
+pymysql
+python-dotenv
+backoff
+prometheus_client
